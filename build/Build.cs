@@ -3,6 +3,7 @@ using Tamp.NetCli.V10;
 using Tamp.Telegram;
 using Tamp.Components;
 using Tamp.Components.NetCli.V10;
+using Tamp.SonarScanner.V10;
 
 class Build : TampBuild, IDotNetTest, IDotNetPack
 {
@@ -28,6 +29,33 @@ class Build : TampBuild, IDotNetTest, IDotNetPack
 
     public AbsolutePath ArtifactsDirectory => Artifacts;
 
+    // The component Test (IDotNetTest) writes coverage under artifacts/test-results; build/coverlet.runsettings
+    // makes it OpenCover, which SonarCloud's sonar.cs.opencover.reportsPaths ingests.
+    AbsolutePath TestResultsDir => Artifacts / "test-results";
+
+    // ----- SonarCloud (SonarQube Cloud) -----
+    // dotnet-sonarscanner is a DLL-based .NET tool; CI installs it globally and resolves from PATH.
+    // Optional so the fast ci build lane doesn't require it.
+    [FromPath("dotnet-sonarscanner", Optional = true)]
+    readonly Tool SonarTool = null!;
+
+    [Secret("SonarCloud token", EnvironmentVariable = "SONAR_TOKEN")]
+    readonly Secret SonarToken = null!;
+
+    [Parameter("Sonar host URL", EnvironmentVariable = "SONAR_HOST_URL")]
+    readonly string SonarHostUrl = "https://sonarcloud.io";
+
+    [Parameter("SonarCloud organization")]
+    readonly string SonarOrganization = "tamp-build";
+
+    [Parameter("SonarCloud project key")]
+    readonly string SonarProjectKey = "tamp-build_tamp-go";
+
+    // PR-decoration inputs (set by ci.yml on pull_request events; empty on branch runs → branch analysis).
+    [Parameter("Pull-request number", EnvironmentVariable = "SONAR_PR_KEY")] readonly string SonarPrKey = "";
+    [Parameter("Pull-request head branch", EnvironmentVariable = "SONAR_PR_BRANCH")] readonly string SonarPrBranch = "";
+    [Parameter("Pull-request base branch", EnvironmentVariable = "SONAR_PR_BASE")] readonly string SonarPrBase = "";
+
     Target Info => _ => _.Executes(() =>
     {
         Console.WriteLine($"  Branch:        {Git.Branch ?? "<detached>"}");
@@ -51,6 +79,37 @@ class Build : TampBuild, IDotNetTest, IDotNetPack
 
     Target Ci => _ => _
         .DependsOn(nameof(Info), nameof(Clean), nameof(ITest.Test), nameof(IPack.Pack));
+
+    // SonarCloud analysis is a two-phase scan: Begin before the build, End after tests.
+    Target SonarBegin => _ => _
+        .Description("Initialize the SonarCloud pre-build phase.")
+        .Before(nameof(ICompile.Compile))
+        .Requires(() => SonarToken != null)
+        .Executes(() => SonarScanner.Begin(SonarTool, s =>
+        {
+            s.SetProjectKey(SonarProjectKey)
+             .SetOrganization(SonarOrganization)
+             .SetHostUrl(SonarHostUrl)
+             .SetToken(SonarToken)
+             .SetProperty("sonar.exclusions", "build/**")
+             .SetProperty("sonar.cs.opencover.reportsPaths", $"{TestResultsDir.Value}/**/coverage.opencover.xml");
+
+            // On a PR run, analyze as a pull request so SonarCloud decorates it with the new-code gate.
+            if (!string.IsNullOrEmpty(SonarPrKey))
+                s.SetProperty("sonar.pullrequest.key", SonarPrKey)
+                 .SetProperty("sonar.pullrequest.branch", SonarPrBranch)
+                 .SetProperty("sonar.pullrequest.base", SonarPrBase);
+        }));
+
+    Target SonarEnd => _ => _
+        .After(nameof(ITest.Test))
+        .DependsOn(nameof(SonarBegin))
+        .Description("Finalize SonarCloud and submit results.")
+        .Executes(() => SonarScanner.End(SonarTool, s => s.SetToken(SonarToken)));
+
+    Target Sonar => _ => _
+        .DependsOn(nameof(SonarBegin), nameof(ITest.Test), nameof(SonarEnd))
+        .Description("Full SonarCloud analysis: begin, build + test coverage (all TFMs), end. Requires SONAR_TOKEN.");
 
     Target Default => _ => _.DependsOn(nameof(ICompile.Compile));
 }
